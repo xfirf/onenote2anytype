@@ -85,5 +85,9 @@ Dieser Modus:
 - baut `objects/*.pb.json`, `filesObjects/*.pb.json`, `files/*`
 - uebernimmt `relations/`, `types/`, `templates/` aus dem Template-Export
 - setzt `details.createdDate` der Seite aus dem Titel-Datum (`12:00` in der gewaehlten Zeitzone)
+- unterstuetzt Sammel-DOCX mit mehreren Journal-Eintraegen:
+  - jeder erkannte Datums-Titel (`dd. Monat yyyy`) wird zu einer eigenen Anytype-Seite
+  - das direkt folgende Wochentag-/Zeit-Headerpaar wird ignoriert
+  - nur der Titel bestimmt das Datum, Zeit ist immer `12:00`
 
 Hinweis: Eine vollstaendige offizielle Spezifikation dieses Formats ist derzeit nicht oeffentlich dokumentiert. Der Prototyp basiert auf Reverse Engineering eines echten Anytype-Exports.

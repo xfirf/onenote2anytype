@@ -59,37 +59,8 @@ def make_bafy_id(seed: str) -> str:
     return "b" + "".join(encoded)
 
 
-def make_content_cid(data: bytes, codec: int = 0x70) -> str:
-    digest = hashlib.sha256(data).digest()
-    cid_bytes = varint_encode(1) + varint_encode(codec) + bytes([0x12, 0x20]) + digest
-    alphabet = "abcdefghijklmnopqrstuvwxyz234567"
-
-    bits = 0
-    bits_left = 0
-    encoded = []
-    for byte in cid_bytes:
-        bits = (bits << 8) | byte
-        bits_left += 8
-        while bits_left >= 5:
-            idx = (bits >> (bits_left - 5)) & 31
-            encoded.append(alphabet[idx])
-            bits_left -= 5
-    if bits_left:
-        idx = (bits << (5 - bits_left)) & 31
-        encoded.append(alphabet[idx])
-
-    return "b" + "".join(encoded)
-
-
 def make_block_id(seed: str) -> str:
     return hashlib.md5(seed.encode("utf-8")).hexdigest()[:24]
-
-
-def safe_file_name(value: str) -> str:
-    cleaned = value.strip()
-    cleaned = re.sub(r'[\\/:*?"<>|]+', "-", cleaned)
-    cleaned = re.sub(r"\s+", " ", cleaned)
-    return cleaned.strip(" .") or "Notiz"
 
 
 def slugify(value: str) -> str:
@@ -157,6 +128,23 @@ class TemplateData:
     passthrough_entries: dict[str, bytes]
 
 
+@dataclass
+class EntrySection:
+    title: str
+    elements: list[Element]
+
+
+ENTRY_TITLE_RE = re.compile(
+    r"^\s*(\d{1,2})\.\s*([A-Za-zÄÖÜäöüß]+)\s+(\d{4})(?:\b|\s*[-–—].*)",
+    re.IGNORECASE,
+)
+WEEKDAY_RE = re.compile(
+    r"^(Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sonntag),\s+\d{1,2}\.\s+[A-Za-zÄÖÜäöüß]+\s+\d{4}$",
+    re.IGNORECASE,
+)
+TIME_RE = re.compile(r"^\d{1,2}:\d{2}$")
+
+
 def load_template(template_zip: Path) -> TemplateData:
     with zipfile.ZipFile(template_zip, "r") as z:
         names = z.namelist()
@@ -200,6 +188,45 @@ def load_template(template_zip: Path) -> TemplateData:
             non_page_objects=non_page_objects,
             passthrough_entries=passthrough_entries,
         )
+
+
+def should_skip_header_artifact(text: str) -> bool:
+    return bool(WEEKDAY_RE.match(text) or TIME_RE.match(text))
+
+
+def split_into_sections(elements: list[Element]) -> list[EntrySection]:
+    sections: list[EntrySection] = []
+    current: EntrySection | None = None
+
+    for element in elements:
+        if isinstance(element, TextElement):
+            text = element.plain_text.strip()
+            if text and ENTRY_TITLE_RE.match(text):
+                if current is not None:
+                    sections.append(current)
+                current = EntrySection(title=text, elements=[element])
+                continue
+
+        if current is not None:
+            current.elements.append(element)
+
+    if current is not None:
+        sections.append(current)
+
+    if sections:
+        return sections
+
+    fallback_title = extract_title(elements)
+    return [EntrySection(title=fallback_title, elements=list(elements))]
+
+
+def select_file_proto(template: TemplateData, mime: str) -> dict:
+    mime_l = mime.lower()
+    for proto in template.file_protos:
+        details = proto.get("snapshot", {}).get("data", {}).get("details", {})
+        if str(details.get("fileMimeType", "")).lower() == mime_l:
+            return proto
+    return template.file_protos[0]
 
 
 def default_restrictions() -> dict:
@@ -264,121 +291,110 @@ def page_from_docx(
     template: TemplateData,
     timezone_name: str,
     seed_prefix: str,
-) -> tuple[dict, list[tuple[str, dict, bytes]]]:
+) -> list[tuple[dict, list[tuple[str, dict, bytes]]]]:
     with zipfile.ZipFile(docx_path, "r") as docx_zip:
         elements = parse_elements(docx_zip)
         if not elements:
             raise ValueError(f"Keine Inhalte in DOCX gefunden: {docx_path}")
 
-        title = extract_title(elements)
-        created_dt = parse_created_datetime_from_title(title, timezone_name)
-        created_unix = int(created_dt.timestamp())
-        page_id = make_bafy_id(f"{seed_prefix}|page|{docx_path.name}|{title}")
+        sections = split_into_sections(elements)
+        out_pages: list[tuple[dict, list[tuple[str, dict, bytes]]]] = []
 
-        # Build content blocks and file objects in order.
-        content_blocks: list[dict] = []
-        file_entries: list[tuple[str, dict, bytes]] = []
-        list_of_file_ids: list[str] = []
-        template_file_pool_by_mime: dict[str, list[dict]] = {}
-        for fp in template.file_protos:
-            det = fp.get("snapshot", {}).get("data", {}).get("details", {})
-            mime_key = str(det.get("fileMimeType", "")).lower()
-            template_file_pool_by_mime.setdefault(mime_key, []).append(fp)
-        template_file_pool_any = list(template.file_protos)
+        for section_index, section in enumerate(sections, start=1):
+            title = section.title
+            created_dt = parse_created_datetime_from_title(title, timezone_name)
+            created_unix = int(created_dt.timestamp())
+            page_id = make_bafy_id(
+                f"{seed_prefix}|page|{docx_path.name}|section:{section_index}|{title}"
+            )
 
-        title_consumed = False
-        content_started = False
-        image_counter = 0
+            content_blocks: list[dict] = []
+            file_entries: list[tuple[str, dict, bytes]] = []
+            list_of_file_ids: list[str] = []
 
-        for idx, element in enumerate(elements):
-            if isinstance(element, TextElement):
-                text = element.plain_text.strip()
-                if not text:
+            title_consumed = False
+            content_started = False
+            image_counter = 0
+
+            for idx, element in enumerate(section.elements):
+                if isinstance(element, TextElement):
+                    text = element.plain_text.strip()
+                    if not text:
+                        continue
+
+                    if not title_consumed and text == title:
+                        title_consumed = True
+                        continue
+
+                    if not content_started and should_skip_header_artifact(text):
+                        continue
+
+                    style = "Marked" if element.list_type else "Paragraph"
+                    bold = element.markdown_text == f"**{text}**"
+                    block_id = make_block_id(f"{page_id}|text|{idx}|{text}")
+                    content_blocks.append(text_block(block_id, text, style, bold))
+                    content_started = True
                     continue
 
-                if not title_consumed and text == title:
-                    title_consumed = True
-                    continue
+                if isinstance(element, ImageElement):
+                    image_counter += 1
+                    source_name = Path(element.source_path).name
+                    ext = normalize_image_ext(Path(source_name).suffix or ".bin")
+                    mime = {
+                        ".jpg": "image/jpeg",
+                        ".jpeg": "image/jpeg",
+                        ".png": "image/png",
+                        ".gif": "image/gif",
+                        ".webp": "image/webp",
+                    }.get(ext, "application/octet-stream")
 
-                # Skip OneNote header artifacts at beginning.
-                if not content_started and (re.match(r"^(Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sonntag),", text) or re.match(r"^\d{1,2}:\d{2}$", text)):
-                    continue
+                    try:
+                        binary = docx_zip.read(element.source_path)
+                    except KeyError:
+                        continue
 
-                style = "Marked" if element.list_type else "Paragraph"
-                bold = element.markdown_text == f"**{text}**"
-                block_id = make_block_id(f"{page_id}|text|{idx}|{text}")
-                content_blocks.append(text_block(block_id, text, style, bold))
-                content_started = True
-                continue
-
-            if isinstance(element, ImageElement):
-                image_counter += 1
-                source_name = Path(element.source_path).name
-                ext = normalize_image_ext(Path(source_name).suffix or ".bin")
-                mime = {
-                    ".jpg": "image/jpeg",
-                    ".jpeg": "image/jpeg",
-                    ".png": "image/png",
-                    ".gif": "image/gif",
-                    ".webp": "image/webp",
-                }.get(ext, "application/octet-stream")
-
-                asset_name = f"{slugify(title)}-image-{image_counter:02d}{ext}"
-
-                try:
-                    binary = docx_zip.read(element.source_path)
-                except KeyError:
-                    continue
-                width_px, height_px = image_dimensions(binary, mime)
-
-                candidates = template_file_pool_by_mime.get(mime.lower()) or template_file_pool_any
-                if not candidates:
-                    raise ValueError(
-                        "Template-ZIP enthaelt nicht genug FileObjects fuer alle Bilder"
+                    width_px, height_px = image_dimensions(binary, mime)
+                    asset_name = (
+                        f"{slugify(docx_path.stem)}-s{section_index:03d}-i{image_counter:03d}{ext}"
                     )
-                selected_template_obj = candidates.pop(0)
-                if selected_template_obj in template_file_pool_any:
-                    template_file_pool_any.remove(selected_template_obj)
-                for pool in template_file_pool_by_mime.values():
-                    if selected_template_obj in pool:
-                        pool.remove(selected_template_obj)
+                    file_id = make_bafy_id(
+                        f"{seed_prefix}|file|{docx_path.name}|section:{section_index}|img:{image_counter}|{asset_name}"
+                    )
+                    block_id = make_block_id(f"{page_id}|image|{idx}|{asset_name}")
 
-                template_file_obj = copy.deepcopy(selected_template_obj)
+                    list_of_file_ids.append(file_id)
+                    content_blocks.append(
+                        file_embed_block(block_id, asset_name, mime, len(binary), file_id)
+                    )
 
-                det = template_file_obj["snapshot"]["data"]["details"]
-                file_id = det.get("id")
-                if not file_id:
-                    raise ValueError("Template-FileObject ohne id gefunden")
+                    template_file_obj = copy.deepcopy(select_file_proto(template, mime))
+                    file_obj = file_object_from_template(
+                        template_obj=template_file_obj,
+                        file_id=file_id,
+                        page_id=page_id,
+                        file_name=Path(asset_name).stem,
+                        file_ext=ext.lstrip("."),
+                        file_mime=mime,
+                        file_size=len(binary),
+                        file_source=asset_name,
+                        width_px=width_px,
+                        height_px=height_px,
+                        created_unix=created_unix,
+                    )
+                    file_entries.append((asset_name, file_obj, binary))
+                    content_started = True
 
-                source_path = str(det.get("source", ""))
-                source_name = Path(source_path.replace("\\", "/")).name
-                if not source_name:
-                    source_name = asset_name
+            page_obj = page_object_from_proto(
+                proto=template.page_proto,
+                page_id=page_id,
+                title=title,
+                created_unix=created_unix,
+                file_ids=list_of_file_ids,
+                content_blocks=content_blocks,
+            )
+            out_pages.append((page_obj, file_entries))
 
-                block_id = make_block_id(f"{page_id}|image|{idx}|{source_name}")
-
-                list_of_file_ids.append(file_id)
-                content_blocks.append(file_embed_block(block_id, source_name, mime, len(binary), file_id))
-                file_obj = file_object_from_template(
-                    template_obj=template_file_obj,
-                    page_id=page_id,
-                    file_size=len(binary),
-                    width_px=width_px,
-                    height_px=height_px,
-                    created_unix=created_unix,
-                )
-                file_entries.append((source_name, file_obj, binary))
-                content_started = True
-
-        page_obj = page_object_from_proto(
-            proto=template.page_proto,
-            page_id=page_id,
-            title=title,
-            created_unix=created_unix,
-            file_ids=list_of_file_ids,
-            content_blocks=content_blocks,
-        )
-        return page_obj, file_entries
+        return out_pages
 
 
 def page_object_from_proto(
@@ -437,8 +453,13 @@ def page_object_from_proto(
 
 def file_object_from_template(
     template_obj: dict,
+    file_id: str,
     page_id: str,
+    file_name: str,
+    file_ext: str,
+    file_mime: str,
     file_size: int,
+    file_source: str,
     width_px: int,
     height_px: int,
     created_unix: int,
@@ -446,21 +467,30 @@ def file_object_from_template(
     obj = copy.deepcopy(template_obj)
     blocks = obj["snapshot"]["data"]["blocks"]
     details = obj["snapshot"]["data"].get("details", {})
-    file_id = details.get("id", "")
+
+    old_root_id = blocks[0].get("id", "") if blocks else ""
 
     for block in blocks:
+        if old_root_id and block.get("id") == old_root_id:
+            block["id"] = file_id
         if "file" in block:
+            block["file"]["name"] = file_name
+            block["file"]["mime"] = file_mime
             block["file"]["size"] = str(file_size)
             block["file"]["targetObjectId"] = file_id
 
+    details["id"] = file_id
+    details["name"] = file_name
+    details["iconImage"] = file_id
+    details["fileExt"] = file_ext
+    details["fileMimeType"] = file_mime
     details["sizeInBytes"] = file_size
     details["widthInPixels"] = width_px
     details["heightInPixels"] = height_px
+    details["createdDate"] = created_unix
     details["lastModifiedDate"] = created_unix
     details["addedDate"] = created_unix
-    source_val = str(details.get("source", ""))
-    if source_val:
-        details["source"] = source_val.replace("\\", "/")
+    details["source"] = f"files/{file_source}"
     details["fileId"] = ""
     details["fileSourceChecksum"] = ""
     details["fileVariantIds"] = []
@@ -477,6 +507,13 @@ def file_object_from_template(
     details["syncDate"] = 0
     details["syncError"] = 0
     details["backlinks"] = [page_id]
+    details["links"] = []
+    details["mentions"] = []
+    details["snippet"] = ""
+    details["importType"] = 3
+    details["origin"] = 3
+    details.pop("oldAnytypeID", None)
+    details.pop("sourceFilePath", None)
     obj["snapshot"]["data"]["details"] = details
 
     return obj
@@ -502,28 +539,29 @@ def build_anytype_zip(
 
         for idx, docx_path in enumerate(docx_files, start=1):
             seed_prefix = f"{output_zip.name}|{idx}|{docx_path.name}|{os.path.getsize(docx_path)}"
-            page_obj, file_entries = page_from_docx(
+            pages = page_from_docx(
                 docx_path=docx_path,
                 template=template,
                 timezone_name=timezone_name,
                 seed_prefix=seed_prefix,
             )
 
-            page_id = page_obj["snapshot"]["data"]["details"]["id"]
-            out.writestr(
-                f"objects/{page_id}.pb.json",
-                json.dumps(page_obj, ensure_ascii=False, separators=(",", ":")),
-            )
-
-            for asset_name, file_obj, binary in file_entries:
-                file_id = file_obj["snapshot"]["data"]["details"]["id"]
+            for page_obj, file_entries in pages:
+                page_id = page_obj["snapshot"]["data"]["details"]["id"]
                 out.writestr(
-                    f"filesObjects/{file_id}.pb.json",
-                    json.dumps(file_obj, ensure_ascii=False, separators=(",", ":")),
+                    f"objects/{page_id}.pb.json",
+                    json.dumps(page_obj, ensure_ascii=False, separators=(",", ":")),
                 )
-                out.writestr(f"files/{asset_name}", binary)
 
-            print(f"OK: {docx_path.name} -> objects/{page_id}.pb.json")
+                for asset_name, file_obj, binary in file_entries:
+                    file_id = file_obj["snapshot"]["data"]["details"]["id"]
+                    out.writestr(
+                        f"filesObjects/{file_id}.pb.json",
+                        json.dumps(file_obj, ensure_ascii=False, separators=(",", ":")),
+                    )
+                    out.writestr(f"files/{asset_name}", binary)
+
+                print(f"OK: {docx_path.name} -> objects/{page_id}.pb.json")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
