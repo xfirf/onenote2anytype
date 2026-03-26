@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import struct
 import sys
 import zipfile
 from dataclasses import dataclass
@@ -58,6 +59,28 @@ def make_bafy_id(seed: str) -> str:
     return "b" + "".join(encoded)
 
 
+def make_content_cid(data: bytes, codec: int = 0x70) -> str:
+    digest = hashlib.sha256(data).digest()
+    cid_bytes = varint_encode(1) + varint_encode(codec) + bytes([0x12, 0x20]) + digest
+    alphabet = "abcdefghijklmnopqrstuvwxyz234567"
+
+    bits = 0
+    bits_left = 0
+    encoded = []
+    for byte in cid_bytes:
+        bits = (bits << 8) | byte
+        bits_left += 8
+        while bits_left >= 5:
+            idx = (bits >> (bits_left - 5)) & 31
+            encoded.append(alphabet[idx])
+            bits_left -= 5
+    if bits_left:
+        idx = (bits << (5 - bits_left)) & 31
+        encoded.append(alphabet[idx])
+
+    return "b" + "".join(encoded)
+
+
 def make_block_id(seed: str) -> str:
     return hashlib.md5(seed.encode("utf-8")).hexdigest()[:24]
 
@@ -76,10 +99,60 @@ def slugify(value: str) -> str:
     return value or "note"
 
 
+def normalize_image_ext(ext: str) -> str:
+    ext_l = ext.lower()
+    if ext_l in {".jpeg", ".jpg"}:
+        return ".jpg"
+    return ext_l
+
+
+def image_dimensions(data: bytes, mime: str) -> tuple[int, int]:
+    if mime == "image/png" and len(data) >= 24 and data.startswith(b"\x89PNG\r\n\x1a\n"):
+        width = int.from_bytes(data[16:20], "big")
+        height = int.from_bytes(data[20:24], "big")
+        return width, height
+
+    if mime == "image/gif" and len(data) >= 10 and data[:3] == b"GIF":
+        width = int.from_bytes(data[6:8], "little")
+        height = int.from_bytes(data[8:10], "little")
+        return width, height
+
+    if mime == "image/webp" and len(data) >= 30 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        chunk = data[12:16]
+        if chunk == b"VP8X" and len(data) >= 30:
+            width = 1 + int.from_bytes(data[24:27], "little")
+            height = 1 + int.from_bytes(data[27:30], "little")
+            return width, height
+
+    if mime == "image/jpeg" and data.startswith(b"\xff\xd8"):
+        i = 2
+        while i + 9 < len(data):
+            if data[i] != 0xFF:
+                i += 1
+                continue
+            marker = data[i + 1]
+            i += 2
+            if marker in {0xD8, 0xD9}:
+                continue
+            if i + 2 > len(data):
+                break
+            seg_len = struct.unpack(">H", data[i : i + 2])[0]
+            if seg_len < 2 or i + seg_len > len(data):
+                break
+            if marker in {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}:
+                if i + 7 < len(data):
+                    height = struct.unpack(">H", data[i + 3 : i + 5])[0]
+                    width = struct.unpack(">H", data[i + 5 : i + 7])[0]
+                    return width, height
+            i += seg_len
+
+    return 0, 0
+
+
 @dataclass
 class TemplateData:
     page_proto: dict
-    file_proto: dict
+    file_protos: list[dict]
     non_page_objects: dict[str, bytes]
     passthrough_entries: dict[str, bytes]
 
@@ -89,7 +162,7 @@ def load_template(template_zip: Path) -> TemplateData:
         names = z.namelist()
 
         page_proto = None
-        file_proto = None
+        file_protos: list[dict] = []
         non_page_objects: dict[str, bytes] = {}
         passthrough_entries: dict[str, bytes] = {}
 
@@ -105,8 +178,8 @@ def load_template(template_zip: Path) -> TemplateData:
 
             if name.startswith("filesObjects/") and name.endswith(".pb.json"):
                 parsed = json.loads(data.decode("utf-8"))
-                if parsed.get("sbType") == "FileObject" and file_proto is None:
-                    file_proto = parsed
+                if parsed.get("sbType") == "FileObject":
+                    file_protos.append(parsed)
                 continue
 
             if (
@@ -118,12 +191,12 @@ def load_template(template_zip: Path) -> TemplateData:
 
         if page_proto is None:
             raise ValueError("Kein Page-Prototyp in Template-ZIP gefunden")
-        if file_proto is None:
+        if not file_protos:
             raise ValueError("Kein FileObject-Prototyp in Template-ZIP gefunden")
 
         return TemplateData(
             page_proto=page_proto,
-            file_proto=file_proto,
+            file_protos=file_protos,
             non_page_objects=non_page_objects,
             passthrough_entries=passthrough_entries,
         )
@@ -206,6 +279,13 @@ def page_from_docx(
         content_blocks: list[dict] = []
         file_entries: list[tuple[str, dict, bytes]] = []
         list_of_file_ids: list[str] = []
+        template_file_pool_by_mime: dict[str, list[dict]] = {}
+        for fp in template.file_protos:
+            det = fp.get("snapshot", {}).get("data", {}).get("details", {})
+            mime_key = str(det.get("fileMimeType", "")).lower()
+            template_file_pool_by_mime.setdefault(mime_key, []).append(fp)
+        template_file_pool_any = list(template.file_protos)
+
         title_consumed = False
         content_started = False
         image_counter = 0
@@ -234,7 +314,7 @@ def page_from_docx(
             if isinstance(element, ImageElement):
                 image_counter += 1
                 source_name = Path(element.source_path).name
-                ext = Path(source_name).suffix.lower() or ".bin"
+                ext = normalize_image_ext(Path(source_name).suffix or ".bin")
                 mime = {
                     ".jpg": "image/jpeg",
                     ".jpeg": "image/jpeg",
@@ -244,28 +324,50 @@ def page_from_docx(
                 }.get(ext, "application/octet-stream")
 
                 asset_name = f"{slugify(title)}-image-{image_counter:02d}{ext}"
-                file_id = make_bafy_id(f"{seed_prefix}|file|{docx_path.name}|{asset_name}")
-                block_id = make_block_id(f"{page_id}|image|{idx}|{asset_name}")
 
                 try:
                     binary = docx_zip.read(element.source_path)
                 except KeyError:
                     continue
+                width_px, height_px = image_dimensions(binary, mime)
+
+                candidates = template_file_pool_by_mime.get(mime.lower()) or template_file_pool_any
+                if not candidates:
+                    raise ValueError(
+                        "Template-ZIP enthaelt nicht genug FileObjects fuer alle Bilder"
+                    )
+                selected_template_obj = candidates.pop(0)
+                if selected_template_obj in template_file_pool_any:
+                    template_file_pool_any.remove(selected_template_obj)
+                for pool in template_file_pool_by_mime.values():
+                    if selected_template_obj in pool:
+                        pool.remove(selected_template_obj)
+
+                template_file_obj = copy.deepcopy(selected_template_obj)
+
+                det = template_file_obj["snapshot"]["data"]["details"]
+                file_id = det.get("id")
+                if not file_id:
+                    raise ValueError("Template-FileObject ohne id gefunden")
+
+                source_path = str(det.get("source", ""))
+                source_name = Path(source_path.replace("\\", "/")).name
+                if not source_name:
+                    source_name = asset_name
+
+                block_id = make_block_id(f"{page_id}|image|{idx}|{source_name}")
 
                 list_of_file_ids.append(file_id)
-                content_blocks.append(file_embed_block(block_id, asset_name, mime, len(binary), file_id))
-                file_obj = file_object_from_proto(
-                    proto=template.file_proto,
-                    file_id=file_id,
+                content_blocks.append(file_embed_block(block_id, source_name, mime, len(binary), file_id))
+                file_obj = file_object_from_template(
+                    template_obj=template_file_obj,
                     page_id=page_id,
-                    file_name=Path(asset_name).stem,
-                    file_ext=ext.lstrip("."),
-                    file_mime=mime,
                     file_size=len(binary),
-                    file_source=asset_name,
+                    width_px=width_px,
+                    height_px=height_px,
                     created_unix=created_unix,
                 )
-                file_entries.append((asset_name, file_obj, binary))
+                file_entries.append((source_name, file_obj, binary))
                 content_started = True
 
         page_obj = page_object_from_proto(
@@ -333,42 +435,48 @@ def page_object_from_proto(
     return obj
 
 
-def file_object_from_proto(
-    proto: dict,
-    file_id: str,
+def file_object_from_template(
+    template_obj: dict,
     page_id: str,
-    file_name: str,
-    file_ext: str,
-    file_mime: str,
     file_size: int,
-    file_source: str,
+    width_px: int,
+    height_px: int,
     created_unix: int,
 ) -> dict:
-    obj = copy.deepcopy(proto)
+    obj = copy.deepcopy(template_obj)
     blocks = obj["snapshot"]["data"]["blocks"]
-    old_root_id = blocks[0]["id"]
+    details = obj["snapshot"]["data"].get("details", {})
+    file_id = details.get("id", "")
 
     for block in blocks:
-        if block.get("id") == old_root_id:
-            block["id"] = file_id
         if "file" in block:
-            block["file"]["name"] = file_name
-            block["file"]["mime"] = file_mime
             block["file"]["size"] = str(file_size)
             block["file"]["targetObjectId"] = file_id
 
-    details = obj["snapshot"]["data"].get("details", {})
-    details["id"] = file_id
-    details["name"] = file_name
-    details["fileExt"] = file_ext
-    details["fileMimeType"] = file_mime
     details["sizeInBytes"] = file_size
+    details["widthInPixels"] = width_px
+    details["heightInPixels"] = height_px
+    details["lastModifiedDate"] = created_unix
     details["addedDate"] = created_unix
-    details["source"] = f"files\\{file_source}"
+    source_val = str(details.get("source", ""))
+    if source_val:
+        details["source"] = source_val.replace("\\", "/")
+    details["fileId"] = ""
+    details["fileSourceChecksum"] = ""
+    details["fileVariantIds"] = []
+    details["fileVariantPaths"] = []
+    details["fileVariantKeys"] = []
+    details["fileVariantChecksums"] = []
+    details["fileVariantMills"] = []
+    details["fileVariantWidths"] = []
+    details["fileVariantOptions"] = []
+    details["fileIndexingStatus"] = 0
+    details["fileSyncStatus"] = 0
+    details["fileBackupStatus"] = 0
+    details["syncStatus"] = 0
+    details["syncDate"] = 0
+    details["syncError"] = 0
     details["backlinks"] = [page_id]
-    details["importType"] = 3
-    details["origin"] = 3
-    details.pop("oldAnytypeID", None)
     obj["snapshot"]["data"]["details"] = details
 
     return obj
