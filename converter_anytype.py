@@ -11,7 +11,7 @@ import struct
 import sys
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -148,15 +148,79 @@ class ManualReviewEntry:
     long_text_lines: int
 
 
-ENTRY_TITLE_RE = re.compile(
-    r"^\s*(\d{1,2})\.\s*([A-Za-zÄÖÜäöüß]+)\s+(\d{4})(?:\b|\s*[-–—].*)",
-    re.IGNORECASE,
-)
+@dataclass
+class ParsedTitleDate:
+    year: int
+    month: int
+    day: int
+    normalized_title: str
+    suffix: str
+
+
 WEEKDAY_RE = re.compile(
     r"^(Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sonntag),\s+\d{1,2}\.\s+[A-Za-zÄÖÜäöüß]+\s+\d{4}$",
     re.IGNORECASE,
 )
 TIME_RE = re.compile(r"^\d{1,2}:\d{2}$")
+
+MONTHS_DE = {
+    "januar": 1,
+    "februar": 2,
+    "maerz": 3,
+    "märz": 3,
+    "april": 4,
+    "mai": 5,
+    "juni": 6,
+    "juli": 7,
+    "august": 8,
+    "september": 9,
+    "oktober": 10,
+    "november": 11,
+    "dezember": 12,
+}
+
+MONTHS_EN = {
+    "january": 1,
+    "february": 2,
+    "march": 3,
+    "april": 4,
+    "may": 5,
+    "june": 6,
+    "july": 7,
+    "august": 8,
+    "september": 9,
+    "october": 10,
+    "november": 11,
+    "december": 12,
+}
+
+MONTHS_DE_BY_NUM = {
+    1: "Januar",
+    2: "Februar",
+    3: "März",
+    4: "April",
+    5: "Mai",
+    6: "Juni",
+    7: "Juli",
+    8: "August",
+    9: "September",
+    10: "Oktober",
+    11: "November",
+    12: "Dezember",
+}
+
+GERMAN_WEEKDAY_DATE_RE = re.compile(
+    r"^(Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sonntag),\s+(\d{1,2})\.\s+([A-Za-zÄÖÜäöüß]+)\s+(\d{4})$",
+    re.IGNORECASE,
+)
+
+ENGLISH_WEEKDAY_DATE_RE = re.compile(
+    r"^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})$",
+    re.IGNORECASE,
+)
+
+TIME_24H_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
+TIME_AMPM_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*([AP]M)$", re.IGNORECASE)
 
 
 def load_template(template_zip: Path) -> TemplateData:
@@ -205,7 +269,179 @@ def load_template(template_zip: Path) -> TemplateData:
 
 
 def should_skip_header_artifact(text: str) -> bool:
-    return bool(WEEKDAY_RE.match(text) or TIME_RE.match(text))
+    return bool(
+        WEEKDAY_RE.match(text)
+        or ENGLISH_WEEKDAY_DATE_RE.match(text)
+        or TIME_RE.match(text)
+        or TIME_AMPM_RE.match(text)
+    )
+
+
+def parse_month_name(value: str) -> int | None:
+    key = value.strip().lower()
+    return MONTHS_DE.get(key) or MONTHS_EN.get(key)
+
+
+def normalize_title(day: int, month: int, year: int, suffix: str) -> str:
+    base = f"{day:02d}. {MONTHS_DE_BY_NUM[month]} {year}"
+    clean_suffix = suffix.strip()
+    if clean_suffix:
+        return f"{base} - {clean_suffix}"
+    return base
+
+
+def parse_title_date(raw_title: str) -> ParsedTitleDate | None:
+    title = raw_title.strip()
+
+    # German title format, optionally with duplicate year and optional suffix after dash.
+    m = re.match(
+        r"^\s*(\d{1,2})\.\s*([A-Za-zÄÖÜäöüß]+)\s*,?\s*(\d{4})(?:\s+\3)?(?:\s*[-–—]\s*(.*))?$",
+        title,
+        re.IGNORECASE,
+    )
+    if m:
+        day = int(m.group(1))
+        month = parse_month_name(m.group(2))
+        year = int(m.group(3))
+        suffix = (m.group(4) or "").strip()
+        if month and 1 <= day <= 31:
+            return ParsedTitleDate(
+                year=year,
+                month=month,
+                day=day,
+                normalized_title=normalize_title(day, month, year, suffix),
+                suffix=suffix,
+            )
+
+    # English month-first format with comma.
+    m = re.match(
+        r"^\s*([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4})(?:\s+at\s+\d{1,2}:\d{2}\s*[AP]M)?(?:\s*[-–—]\s*(.*))?$",
+        title,
+        re.IGNORECASE,
+    )
+    if not m:
+        # English month-first format without comma.
+        m = re.match(
+            r"^\s*([A-Za-z]+)\s+(\d{1,2})\s+(\d{4})(?:\s+at\s+\d{1,2}:\d{2}\s*[AP]M)?(?:\s*[-–—]\s*(.*))?$",
+            title,
+            re.IGNORECASE,
+        )
+
+    if m:
+        month = parse_month_name(m.group(1))
+        day = int(m.group(2))
+        year = int(m.group(3))
+        suffix = (m.group(4) or "").strip()
+        if month and 1 <= day <= 31:
+            return ParsedTitleDate(
+                year=year,
+                month=month,
+                day=day,
+                normalized_title=normalize_title(day, month, year, suffix),
+                suffix=suffix,
+            )
+
+    return None
+
+
+def parse_weekday_date(raw: str) -> date | None:
+    text = raw.strip()
+    m = GERMAN_WEEKDAY_DATE_RE.match(text)
+    if m:
+        day = int(m.group(2))
+        month = parse_month_name(m.group(3))
+        year = int(m.group(4))
+        if month:
+            try:
+                return date(year, month, day)
+            except ValueError:
+                return None
+
+    m = ENGLISH_WEEKDAY_DATE_RE.match(text)
+    if m:
+        month = parse_month_name(m.group(2))
+        day = int(m.group(3))
+        year = int(m.group(4))
+        if month:
+            try:
+                return date(year, month, day)
+            except ValueError:
+                return None
+
+    return None
+
+
+def parse_time_value(raw: str) -> tuple[int, int] | None:
+    text = raw.strip()
+    m = TIME_24H_RE.match(text)
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return hour, minute
+        return None
+
+    m = TIME_AMPM_RE.match(text)
+    if m:
+        hour = int(m.group(1))
+        minute = int(m.group(2))
+        ampm = m.group(3).upper()
+        if not (1 <= hour <= 12 and 0 <= minute <= 59):
+            return None
+        if ampm == "AM":
+            hour = 0 if hour == 12 else hour
+        else:
+            hour = 12 if hour == 12 else hour + 12
+        return hour, minute
+
+    return None
+
+
+def resolve_time_from_section(section: EntrySection) -> tuple[int, int]:
+    title_date = parse_title_date(section.title)
+    if not title_date:
+        return 12, 0
+
+    title_consumed = False
+    weekday_dt: date | None = None
+    parsed_time: tuple[int, int] | None = None
+
+    for element in section.elements:
+        if not isinstance(element, TextElement):
+            continue
+        text = element.plain_text.strip()
+        if not text:
+            continue
+
+        if not title_consumed and text == section.title:
+            title_consumed = True
+            continue
+
+        if weekday_dt is None:
+            weekday_dt = parse_weekday_date(text)
+            if weekday_dt is not None:
+                continue
+
+        if parsed_time is None:
+            parsed_time = parse_time_value(text)
+            if parsed_time is not None:
+                break
+
+        # If we hit normal content before finding both header fields, stop scanning.
+        break
+
+    if weekday_dt is None or parsed_time is None:
+        return 12, 0
+
+    try:
+        title_dt = date(title_date.year, title_date.month, title_date.day)
+    except ValueError:
+        return 12, 0
+
+    if weekday_dt == title_dt:
+        return parsed_time
+
+    return 12, 0
 
 
 def split_into_sections(elements: list[Element]) -> list[EntrySection]:
@@ -215,7 +451,7 @@ def split_into_sections(elements: list[Element]) -> list[EntrySection]:
     for element in elements:
         if isinstance(element, TextElement):
             text = element.plain_text.strip()
-            if text and ENTRY_TITLE_RE.match(text):
+            if text and parse_title_date(text):
                 if current is not None:
                     sections.append(current)
                 current = EntrySection(title=text, elements=[element])
@@ -251,24 +487,22 @@ def infer_doc_year_from_filename(docx_path: Path) -> int | None:
 
 
 def resolve_created_datetime(
-    title: str,
+    parsed_title: ParsedTitleDate,
     timezone_name: str,
     doc_year_override: int | None,
+    hour: int,
+    minute: int,
 ) -> tuple[datetime, bool]:
-    created_dt = parse_created_datetime_from_title(title, timezone_name)
-    if doc_year_override is None:
-        return created_dt, False
+    normalized_title = parsed_title.normalized_title
+    created_dt = parse_created_datetime_from_title(normalized_title, timezone_name)
+    created_dt = created_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
-    match = ENTRY_TITLE_RE.match(title)
-    if not match:
-        return created_dt, False
-
-    parsed_year = int(match.group(3))
-    if parsed_year == doc_year_override:
+    if doc_year_override is None or parsed_title.year == doc_year_override:
         return created_dt, False
 
     try:
-        return created_dt.replace(year=doc_year_override), True
+        corrected = created_dt.replace(year=doc_year_override)
+        return corrected, True
     except ValueError:
         return created_dt, False
 
@@ -355,14 +589,30 @@ def page_from_docx(
         )
 
         for section_index, section in enumerate(sections, start=1):
-            title = section.title
+            parsed_title = parse_title_date(section.title)
+            if parsed_title is None:
+                raise ValueError(
+                    f"Titelzeile konnte nicht als Datum erkannt werden: {section.title!r}"
+                )
+
+            title = parsed_title.normalized_title
+            time_hour, time_minute = resolve_time_from_section(section)
             created_dt, was_corrected = resolve_created_datetime(
-                title=title,
+                parsed_title=parsed_title,
                 timezone_name=timezone_name,
                 doc_year_override=doc_year_override,
+                hour=time_hour,
+                minute=time_minute,
             )
             if was_corrected:
                 corrected_year_count += 1
+                corrected_title = normalize_title(
+                    parsed_title.day,
+                    parsed_title.month,
+                    doc_year_override or parsed_title.year,
+                    parsed_title.suffix,
+                )
+                title = corrected_title
             created_unix = int(created_dt.timestamp())
             page_id = make_bafy_id(
                 f"{seed_prefix}|page|{docx_path.name}|section:{section_index}|{title}"
@@ -393,7 +643,7 @@ def page_from_docx(
                         max_image_cluster = current_image_cluster
                     current_image_cluster = 0
 
-                    if not title_consumed and text == title:
+                    if not title_consumed and text == section.title:
                         title_consumed = True
                         continue
 

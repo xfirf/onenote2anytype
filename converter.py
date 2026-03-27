@@ -39,7 +39,12 @@ WEEKDAY_RE = re.compile(
     r"^(Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sonntag),\s+\d{1,2}\.\s+[A-Za-zÄÖÜäöüß]+\s+\d{4}$",
     re.IGNORECASE,
 )
+WEEKDAY_EN_RE = re.compile(
+    r"^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s+[A-Za-z]+\s+\d{1,2},\s*\d{4}$",
+    re.IGNORECASE,
+)
 TIME_RE = re.compile(r"^\d{1,2}:\d{2}$")
+TIME_AMPM_RE = re.compile(r"^\d{1,2}:\d{2}\s*[AP]M$", re.IGNORECASE)
 
 
 @dataclass
@@ -287,7 +292,12 @@ def extract_title(elements: Iterable[Element]) -> str:
 
 
 def should_skip_header_artifact(text: str) -> bool:
-    return bool(WEEKDAY_RE.match(text) or TIME_RE.match(text))
+    return bool(
+        WEEKDAY_RE.match(text)
+        or WEEKDAY_EN_RE.match(text)
+        or TIME_RE.match(text)
+        or TIME_AMPM_RE.match(text)
+    )
 
 
 def markdown_from_elements(
