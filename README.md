@@ -1,93 +1,85 @@
 # onenote2anytype
 
-Kleine erste Version eines Converters von OneNote-DOCX-Exporten zu einem Anytype-importierbaren ZIP (Markdown + Assets).
+OneNote-DOCX -> Anytype-Import (Import-Typ `Anytype`).
 
-## Status
+Der aktuelle Fokus liegt auf `converter_anytype.py`.
 
-- V1 (MVP)
-- Input: `.docx` (einzelne Datei oder ganzer Ordner)
-- Output: `.zip` mit `.md` Dateien und `assets/` Bildern
+## Was der Converter macht
 
-## Features in V1
+- Liest `.docx` als einzelne Datei oder als kompletten Ordner.
+- Erzeugt ein ZIP im Anytype-Exportformat mit:
+  - `objects/*.pb.json`
+  - `filesObjects/*.pb.json`
+  - `files/*`
+  - `relations/`, `types/`, `templates/` (aus Template-Export)
+- Erkennt mehrere Journal-Eintraege in einem Sammel-DOCX:
+  - jede Titelzeile `dd. Monat yyyy` startet eine neue Anytype-Seite
+- Datumsregel:
+  - nur die Titelzeile bestimmt `createdDate`
+  - direkt folgende Wochentag-/Uhrzeit-Zeilen werden ignoriert
+  - Uhrzeit ist immer `12:00` in der gewaehlten Zeitzone
+- Uebernimmt Bilder, Fett-Markierungen und einfache Aufzaehlungen.
 
-- Liest Texte und eingebettete Bilder aus DOCX.
-- Nutzt die erste sinnvolle Textzeile als Titel.
-- Schreibt Markdown-Dateinamen standardmaessig als echten Titel (z. B. `04. Januar 2026.md`).
-- Extrahiert `source_created_date` immer aus dem Titelbeginn im Format `dd. Monat yyyy`.
-  - Beispiel: `24. Juli 2025 - Urlaub xyz` -> Datum `2025-07-24T12:00:00Z`
-- Setzt Uhrzeit immer auf `12:00:00` in der konfigurierten Zeitzone (Default `Europe/Berlin`).
-- Uebernimmt einfache Formatierungen aus DOCX:
-  - **fett**
-  - Aufzaehlungen (Bullet/Nummerierung)
-- Ignoriert OneNote-Header-Artefakte am Anfang (`Montag, ...` und `HH:MM`).
+## Voraussetzungen
 
-## Verwendung
+- Python 3.11+
+- Ein Anytype-Export als Template-ZIP, z. B.:
+  - `Anytype-Template.zip`
 
-```bash
-python converter.py --input "F:\\path\\to\\docx-or-folder" --output "F:\\path\\to\\anytype-import.zip"
-```
+Der Converter nutzt standardmaessig `Anytype-Template.zip` im aktuellen Ordner.
 
-Wenn `--output` fehlt, wird `anytype-import.zip` im aktuellen Ordner erzeugt.
+## Beispiele
 
-Optional kannst du die Zeitzone setzen:
-
-```bash
-python converter.py --input "F:\\path\\to\\docx-or-folder" --timezone "Europe/Berlin"
-```
-
-## Kompatibilitaetsoptionen
-
-Falls ein Import fehlschlaegt, kannst du eine minimalere ZIP-Variante erzeugen:
+Einzelne DOCX konvertieren:
 
 ```bash
-python converter.py --input "F:\\path\\to\\docx-or-folder" --output "F:\\path\\to\\anytype-import-compat.zip" --no-frontmatter --zip-root vault
+python converter_anytype.py --input "F:\\dev\\onenote2anynote\\04.docx" --output "F:\\dev\\onenote2anynote\\anytype-native-import.zip"
 ```
 
-- `--no-frontmatter`: schreibt kein YAML-Frontmatter
-- `--zip-root vault`: legt alle Dateien unter `vault/` in der ZIP ab
-
-## Ausgabeformat
-
-Die ZIP enthält z. B.:
-
-```text
-my-note.md
-assets/my-note-image-01.jpeg
-assets/my-note-image-02.jpeg
-```
-
-Markdown enthält Frontmatter:
-
-```yaml
----
-title: "04. Januar 2026"
-date: "2026-01-04T12:00:00+01:00"
-source_created_date: "2026-01-04T12:00:00+01:00"
-source_created_unix: 1767524400
-source_format: onenote-docx
----
-```
-
-## Hinweis
-
-Diese V1 baut bewusst **Markdown+Assets** für den Anytype-Importpfad.
-Das interne Any-Block-Exportformat (`*.pb.json`) wird in V1 nicht generiert.
-
-## Anytype-native Exportstruktur (V2 Prototyp)
-
-Wenn du im Anytype-Importer den Typ `Anytype` verwenden willst, nutze den nativen Converter:
+Ordner mit vielen DOCX-Dateien konvertieren:
 
 ```bash
-python converter_anytype.py --input "F:\\path\\to\\docx-or-folder" --template-zip "F:\\path\\to\\Anytype-export.zip" --output "F:\\path\\to\\anytype-native-import.zip"
+python converter_anytype.py --input "F:\\OneNoteExport\\2026" --output "F:\\dev\\onenote2anynote\\anytype-native-import-2026.zip"
 ```
 
-Dieser Modus:
-- baut `objects/*.pb.json`, `filesObjects/*.pb.json`, `files/*`
-- uebernimmt `relations/`, `types/`, `templates/` aus dem Template-Export
-- setzt `details.createdDate` der Seite aus dem Titel-Datum (`12:00` in der gewaehlten Zeitzone)
-- unterstuetzt Sammel-DOCX mit mehreren Journal-Eintraegen:
-  - jeder erkannte Datums-Titel (`dd. Monat yyyy`) wird zu einer eigenen Anytype-Seite
-  - das direkt folgende Wochentag-/Zeit-Headerpaar wird ignoriert
-  - nur der Titel bestimmt das Datum, Zeit ist immer `12:00`
+Mit expliziter Zeitzone:
 
-Hinweis: Eine vollstaendige offizielle Spezifikation dieses Formats ist derzeit nicht oeffentlich dokumentiert. Der Prototyp basiert auf Reverse Engineering eines echten Anytype-Exports.
+```bash
+python converter_anytype.py --input "F:\\OneNoteExport\\2026" --output "F:\\dev\\onenote2anynote\\anytype-native-import-2026.zip" --timezone "Europe/Berlin"
+```
+
+Mit Handschrift-Review-Report:
+
+```bash
+python converter_anytype.py --input "F:\\dev\\onenote2anynote\\2025.docx" --output "F:\\dev\\onenote2anynote\\anytype-native-import-2025.zip" --ink-cluster-threshold 40 --manual-review-report "F:\\dev\\onenote2anynote\\manual-review-entries.md"
+```
+
+Wenn `--manual-review-report` nicht gesetzt ist, wird automatisch neben der Ausgabe-ZIP eine Datei `<output>-manual-review.md` erstellt (falls verdaechtige Eintraege erkannt wurden).
+
+Dry-Run (nur Liste zum manuellen Nacharbeiten, ohne ZIP-Erzeugung):
+
+```bash
+python converter_anytype.py --input "F:\\dev\\onenote2anynote\\2025.docx" --dry-run --ink-cluster-threshold 40 --manual-review-report "F:\\dev\\onenote2anynote\\manual-review-entries.md"
+```
+
+Im Dry-Run ist kein Template noetig, weil nur analysiert wird.
+
+Wenn dein Template an einem anderen Ort liegt:
+
+```bash
+python converter_anytype.py --input "F:\\OneNoteExport\\2026" --template-zip "F:\\Templates\\Anytype-Template.zip" --output "F:\\dev\\onenote2anynote\\anytype-native-import-2026.zip"
+```
+
+## Import in Anytype
+
+1. In Anytype auf `Import` gehen.
+2. Import-Typ `Anytype` waehlen.
+3. Das erzeugte ZIP auswaehlen.
+
+## Hinweise
+
+- Das interne Anytype-Format ist nicht vollstaendig oeffentlich spezifiziert.
+- Der Converter ist deshalb template-basiert (Reverse Engineering aus echtem Export).
+- Wenn Titel-Datum und OneNote-Wochentag widersprechen, gilt immer der Titel.
+
+Viel Spass beim Importieren 🚀

@@ -134,6 +134,19 @@ class EntrySection:
     elements: list[Element]
 
 
+@dataclass
+class ManualReviewEntry:
+    source_docx: str
+    title: str
+    reason: str
+    total_images: int
+    png_images: int
+    tiny_png_images: int
+    max_image_cluster: int
+    short_text_lines: int
+    long_text_lines: int
+
+
 ENTRY_TITLE_RE = re.compile(
     r"^\s*(\d{1,2})\.\s*([A-Za-zÄÖÜäöüß]+)\s+(\d{4})(?:\b|\s*[-–—].*)",
     re.IGNORECASE,
@@ -291,7 +304,8 @@ def page_from_docx(
     template: TemplateData,
     timezone_name: str,
     seed_prefix: str,
-) -> list[tuple[dict, list[tuple[str, dict, bytes]]]]:
+    ink_cluster_threshold: int,
+) -> tuple[list[tuple[dict, list[tuple[str, dict, bytes]]]], list[ManualReviewEntry]]:
     with zipfile.ZipFile(docx_path, "r") as docx_zip:
         elements = parse_elements(docx_zip)
         if not elements:
@@ -299,6 +313,7 @@ def page_from_docx(
 
         sections = split_into_sections(elements)
         out_pages: list[tuple[dict, list[tuple[str, dict, bytes]]]] = []
+        review_entries: list[ManualReviewEntry] = []
 
         for section_index, section in enumerate(sections, start=1):
             title = section.title
@@ -315,6 +330,13 @@ def page_from_docx(
             title_consumed = False
             content_started = False
             image_counter = 0
+            total_images = 0
+            png_images = 0
+            tiny_png_images = 0
+            max_image_cluster = 0
+            current_image_cluster = 0
+            short_text_lines = 0
+            long_text_lines = 0
 
             for idx, element in enumerate(section.elements):
                 if isinstance(element, TextElement):
@@ -322,12 +344,25 @@ def page_from_docx(
                     if not text:
                         continue
 
+                    if current_image_cluster > max_image_cluster:
+                        max_image_cluster = current_image_cluster
+                    current_image_cluster = 0
+
                     if not title_consumed and text == title:
                         title_consumed = True
                         continue
 
                     if not content_started and should_skip_header_artifact(text):
                         continue
+
+                    lowered = text.lower()
+                    if lowered.startswith("was war heute gut"):
+                        pass
+                    else:
+                        if len(text) <= 2:
+                            short_text_lines += 1
+                        if len(text) >= 40:
+                            long_text_lines += 1
 
                     style = "Marked" if element.list_type else "Paragraph"
                     bold = element.markdown_text == f"**{text}**"
@@ -338,6 +373,8 @@ def page_from_docx(
 
                 if isinstance(element, ImageElement):
                     image_counter += 1
+                    total_images += 1
+                    current_image_cluster += 1
                     source_name = Path(element.source_path).name
                     ext = normalize_image_ext(Path(source_name).suffix or ".bin")
                     mime = {
@@ -354,6 +391,10 @@ def page_from_docx(
                         continue
 
                     width_px, height_px = image_dimensions(binary, mime)
+                    if mime == "image/png":
+                        png_images += 1
+                        if width_px <= 80 and height_px <= 80:
+                            tiny_png_images += 1
                     asset_name = (
                         f"{slugify(docx_path.stem)}-s{section_index:03d}-i{image_counter:03d}{ext}"
                     )
@@ -394,7 +435,31 @@ def page_from_docx(
             )
             out_pages.append((page_obj, file_entries))
 
-        return out_pages
+            if current_image_cluster > max_image_cluster:
+                max_image_cluster = current_image_cluster
+
+            reason = ""
+            if max_image_cluster >= ink_cluster_threshold:
+                reason = f"ink-fragment cluster ({max_image_cluster} images in sequence)"
+            elif png_images > 0 and short_text_lines >= 2 and long_text_lines == 0:
+                reason = "possible handwriting-only note (PNG + very short text lines)"
+
+            if reason:
+                review_entries.append(
+                    ManualReviewEntry(
+                        source_docx=docx_path.name,
+                        title=title,
+                        reason=reason,
+                        total_images=total_images,
+                        png_images=png_images,
+                        tiny_png_images=tiny_png_images,
+                        max_image_cluster=max_image_cluster,
+                        short_text_lines=short_text_lines,
+                        long_text_lines=long_text_lines,
+                    )
+                )
+
+        return out_pages, review_entries
 
 
 def page_object_from_proto(
@@ -524,9 +589,11 @@ def build_anytype_zip(
     output_zip: Path,
     template_zip: Path,
     timezone_name: str,
-) -> None:
+    ink_cluster_threshold: int,
+) -> list[ManualReviewEntry]:
     template = load_template(template_zip)
     output_zip.parent.mkdir(parents=True, exist_ok=True)
+    all_review_entries: list[ManualReviewEntry] = []
 
     with zipfile.ZipFile(output_zip, "w", compression=zipfile.ZIP_DEFLATED) as out:
         # Keep baseline schema files.
@@ -539,12 +606,14 @@ def build_anytype_zip(
 
         for idx, docx_path in enumerate(docx_files, start=1):
             seed_prefix = f"{output_zip.name}|{idx}|{docx_path.name}|{os.path.getsize(docx_path)}"
-            pages = page_from_docx(
+            pages, review_entries = page_from_docx(
                 docx_path=docx_path,
                 template=template,
                 timezone_name=timezone_name,
                 seed_prefix=seed_prefix,
+                ink_cluster_threshold=ink_cluster_threshold,
             )
+            all_review_entries.extend(review_entries)
 
             for page_obj, file_entries in pages:
                 page_id = page_obj["snapshot"]["data"]["details"]["id"]
@@ -563,6 +632,149 @@ def build_anytype_zip(
 
                 print(f"OK: {docx_path.name} -> objects/{page_id}.pb.json")
 
+    return all_review_entries
+
+
+def collect_manual_review_entries(
+    docx_files: Iterable[Path],
+    ink_cluster_threshold: int,
+) -> list[ManualReviewEntry]:
+    entries: list[ManualReviewEntry] = []
+
+    for docx_path in docx_files:
+        with zipfile.ZipFile(docx_path, "r") as docx_zip:
+            elements = parse_elements(docx_zip)
+            if not elements:
+                continue
+            sections = split_into_sections(elements)
+
+            for section in sections:
+                total_images = 0
+                png_images = 0
+                tiny_png_images = 0
+                max_image_cluster = 0
+                current_image_cluster = 0
+                short_text_lines = 0
+                long_text_lines = 0
+
+                title_consumed = False
+                content_started = False
+
+                for element in section.elements:
+                    if isinstance(element, TextElement):
+                        text = element.plain_text.strip()
+                        if not text:
+                            continue
+
+                        if current_image_cluster > max_image_cluster:
+                            max_image_cluster = current_image_cluster
+                        current_image_cluster = 0
+
+                        if not title_consumed and text == section.title:
+                            title_consumed = True
+                            continue
+
+                        if not content_started and should_skip_header_artifact(text):
+                            continue
+
+                        lowered = text.lower()
+                        if not lowered.startswith("was war heute gut"):
+                            if len(text) <= 2:
+                                short_text_lines += 1
+                            if len(text) >= 40:
+                                long_text_lines += 1
+
+                        content_started = True
+                        continue
+
+                    if isinstance(element, ImageElement):
+                        total_images += 1
+                        current_image_cluster += 1
+
+                        ext = normalize_image_ext(Path(element.source_path).suffix or ".bin")
+                        mime = {
+                            ".jpg": "image/jpeg",
+                            ".jpeg": "image/jpeg",
+                            ".png": "image/png",
+                            ".gif": "image/gif",
+                            ".webp": "image/webp",
+                        }.get(ext, "application/octet-stream")
+
+                        if mime == "image/png":
+                            png_images += 1
+
+                        try:
+                            binary = docx_zip.read(element.source_path)
+                        except KeyError:
+                            continue
+
+                        width_px, height_px = image_dimensions(binary, mime)
+                        if mime == "image/png" and width_px <= 80 and height_px <= 80:
+                            tiny_png_images += 1
+
+                if current_image_cluster > max_image_cluster:
+                    max_image_cluster = current_image_cluster
+
+                reason = ""
+                if max_image_cluster >= ink_cluster_threshold:
+                    reason = f"ink-fragment cluster ({max_image_cluster} images in sequence)"
+                elif png_images > 0 and short_text_lines >= 2 and long_text_lines == 0:
+                    reason = "possible handwriting-only note (PNG + very short text lines)"
+
+                if reason:
+                    entries.append(
+                        ManualReviewEntry(
+                            source_docx=docx_path.name,
+                            title=section.title,
+                            reason=reason,
+                            total_images=total_images,
+                            png_images=png_images,
+                            tiny_png_images=tiny_png_images,
+                            max_image_cluster=max_image_cluster,
+                            short_text_lines=short_text_lines,
+                            long_text_lines=long_text_lines,
+                        )
+                    )
+
+    return entries
+
+
+def write_manual_review_report(report_path: Path, entries: list[ManualReviewEntry]) -> None:
+    lines = ["# Manual Review: Handschrift-Verdaechtige Eintraege", ""]
+
+    if not entries:
+        lines.extend(
+            [
+                "Keine verdaechtigen Eintraege erkannt.",
+                "",
+            ]
+        )
+    else:
+        lines.extend(
+            [
+                "Diese Eintraege enthalten wahrscheinlich OneNote-Handschriftfragmente und sollten manuell geprueft/exportiert werden.",
+                "",
+            ]
+        )
+
+        for entry in entries:
+            lines.append(f"- Quelle: `{entry.source_docx}`")
+            lines.append(f"- Titel: `{entry.title}`")
+            lines.append(f"- Grund: {entry.reason}")
+            lines.append(
+                "- Metriken: "
+                f"total_images={entry.total_images}, "
+                f"png_images={entry.png_images}, "
+                f"tiny_png_images={entry.tiny_png_images}, "
+                f"max_image_cluster={entry.max_image_cluster}, "
+                f"short_text_lines={entry.short_text_lines}, "
+                f"long_text_lines={entry.long_text_lines}"
+            )
+            lines.append("")
+
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -571,14 +783,33 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--input", required=True, help=".docx Datei oder Ordner mit .docx")
     parser.add_argument("--output", default="anytype-import.zip", help="Ziel-ZIP")
     parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Nur analysieren und Manual-Review-Report erzeugen (kein ZIP schreiben)",
+    )
+    parser.add_argument(
         "--template-zip",
-        required=True,
-        help="Anytype Export-ZIP als Template (enthaelt relations/types/templates)",
+        default="Anytype-Template.zip",
+        help=(
+            "Anytype Export-ZIP als Template (enthaelt relations/types/templates). "
+            "Default: Anytype-Template.zip"
+        ),
     )
     parser.add_argument(
         "--timezone",
         default="Europe/Berlin",
         help="Zeitzone fuer 12:00 Timestamp aus Titel",
+    )
+    parser.add_argument(
+        "--ink-cluster-threshold",
+        type=int,
+        default=40,
+        help="Schwellwert fuer Handschrift-Cluster (Default: 40)",
+    )
+    parser.add_argument(
+        "--manual-review-report",
+        default="",
+        help="Optionaler Pfad fuer Handschrift-Review-Report (.md)",
     )
     return parser.parse_args(argv)
 
@@ -589,15 +820,42 @@ def main(argv: list[str]) -> int:
         input_path = Path(args.input).expanduser().resolve()
         output_zip = Path(args.output).expanduser().resolve()
         template_zip = Path(args.template_zip).expanduser().resolve()
+        report_path = (
+            Path(args.manual_review_report).expanduser().resolve()
+            if args.manual_review_report
+            else (
+                Path("manual-review-dry-run.md").resolve()
+                if args.dry_run
+                else output_zip.with_name(f"{output_zip.stem}-manual-review.md")
+            )
+        )
 
         docx_files = discover_docx_files(input_path)
-        build_anytype_zip(
-            docx_files=docx_files,
-            output_zip=output_zip,
-            template_zip=template_zip,
-            timezone_name=args.timezone,
-        )
-        print(f"Fertig: {output_zip}")
+        if args.dry_run:
+            review_entries = collect_manual_review_entries(
+                docx_files=docx_files,
+                ink_cluster_threshold=args.ink_cluster_threshold,
+            )
+        else:
+            if not template_zip.exists():
+                raise ValueError(
+                    "Template-ZIP nicht gefunden: "
+                    f"{template_zip}. Lege eine Datei wie 'Anytype-Template.zip' bereit "
+                    "oder nutze --template-zip <pfad>."
+                )
+            review_entries = build_anytype_zip(
+                docx_files=docx_files,
+                output_zip=output_zip,
+                template_zip=template_zip,
+                timezone_name=args.timezone,
+                ink_cluster_threshold=args.ink_cluster_threshold,
+            )
+        write_manual_review_report(report_path, review_entries)
+        print(f"Manual-Review-Report: {report_path}")
+        if args.dry_run:
+            print(f"Dry-Run fertig. Verdaechtige Eintraege: {len(review_entries)}")
+        else:
+            print(f"Fertig: {output_zip}")
         return 0
     except Exception as exc:  # noqa: BLE001
         print(f"Fehler: {exc}", file=sys.stderr)
