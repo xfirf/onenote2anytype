@@ -580,6 +580,7 @@ def page_from_docx(
         out_pages: list[tuple[dict, list[tuple[str, dict, bytes]]]] = []
         review_entries: list[ManualReviewEntry] = []
         corrected_year_count = 0
+        image_counter_by_entry_slug: dict[str, int] = {}
         doc_year_override = infer_doc_year_from_filename(docx_path)
         template_page_type_id = (
             template.page_proto.get("snapshot", {})
@@ -596,6 +597,7 @@ def page_from_docx(
                 )
 
             title = parsed_title.normalized_title
+            entry_slug = slugify(title)
             time_hour, time_minute = resolve_time_from_section(section)
             created_dt, was_corrected = resolve_created_datetime(
                 parsed_title=parsed_title,
@@ -690,8 +692,10 @@ def page_from_docx(
                         png_images += 1
                         if width_px <= 80 and height_px <= 80:
                             tiny_png_images += 1
+                    entry_image_counter = image_counter_by_entry_slug.get(entry_slug, 0) + 1
+                    image_counter_by_entry_slug[entry_slug] = entry_image_counter
                     asset_name = (
-                        f"{slugify(docx_path.stem)}-s{section_index:03d}-i{image_counter:03d}{ext}"
+                        f"{entry_slug}-i{entry_image_counter:02d}{ext}"
                     )
                     file_id = make_bafy_id(
                         f"{seed_prefix}|file|{docx_path.name}|section:{section_index}|img:{image_counter}|{asset_name}"
