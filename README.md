@@ -63,6 +63,7 @@ python converter_anytype.py --input "F:\\dev\\onenote2anynote\\2025.docx" --dry-
 ```
 
 Im Dry-Run ist kein Template noetig, weil nur analysiert wird.
+Wenn keine verdaechtigen Eintraege gefunden werden, wird im Dry-Run keine Report-Datei angelegt.
 
 Wenn dein Template an einem anderen Ort liegt:
 

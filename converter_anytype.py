@@ -850,11 +850,16 @@ def main(argv: list[str]) -> int:
                 timezone_name=args.timezone,
                 ink_cluster_threshold=args.ink_cluster_threshold,
             )
-        write_manual_review_report(report_path, review_entries)
-        print(f"Manual-Review-Report: {report_path}")
         if args.dry_run:
+            if review_entries:
+                write_manual_review_report(report_path, review_entries)
+                print(f"Manual-Review-Report: {report_path}")
+            else:
+                print("Dry-Run: keine verdaechtigen Eintraege gefunden (kein Report geschrieben).")
             print(f"Dry-Run fertig. Verdaechtige Eintraege: {len(review_entries)}")
         else:
+            write_manual_review_report(report_path, review_entries)
+            print(f"Manual-Review-Report: {report_path}")
             print(f"Fertig: {output_zip}")
         return 0
     except Exception as exc:  # noqa: BLE001
