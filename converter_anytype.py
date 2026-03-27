@@ -11,6 +11,7 @@ import struct
 import sys
 import zipfile
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
@@ -242,6 +243,36 @@ def select_file_proto(template: TemplateData, mime: str) -> dict:
     return template.file_protos[0]
 
 
+def infer_doc_year_from_filename(docx_path: Path) -> int | None:
+    match = re.search(r"\b(20\d{2})\b", docx_path.stem)
+    if not match:
+        return None
+    return int(match.group(1))
+
+
+def resolve_created_datetime(
+    title: str,
+    timezone_name: str,
+    doc_year_override: int | None,
+) -> tuple[datetime, bool]:
+    created_dt = parse_created_datetime_from_title(title, timezone_name)
+    if doc_year_override is None:
+        return created_dt, False
+
+    match = ENTRY_TITLE_RE.match(title)
+    if not match:
+        return created_dt, False
+
+    parsed_year = int(match.group(3))
+    if parsed_year == doc_year_override:
+        return created_dt, False
+
+    try:
+        return created_dt.replace(year=doc_year_override), True
+    except ValueError:
+        return created_dt, False
+
+
 def default_restrictions() -> dict:
     return {
         "read": False,
@@ -305,7 +336,7 @@ def page_from_docx(
     timezone_name: str,
     seed_prefix: str,
     ink_cluster_threshold: int,
-) -> tuple[list[tuple[dict, list[tuple[str, dict, bytes]]]], list[ManualReviewEntry]]:
+) -> tuple[list[tuple[dict, list[tuple[str, dict, bytes]]]], list[ManualReviewEntry], int]:
     with zipfile.ZipFile(docx_path, "r") as docx_zip:
         elements = parse_elements(docx_zip)
         if not elements:
@@ -314,10 +345,18 @@ def page_from_docx(
         sections = split_into_sections(elements)
         out_pages: list[tuple[dict, list[tuple[str, dict, bytes]]]] = []
         review_entries: list[ManualReviewEntry] = []
+        corrected_year_count = 0
+        doc_year_override = infer_doc_year_from_filename(docx_path)
 
         for section_index, section in enumerate(sections, start=1):
             title = section.title
-            created_dt = parse_created_datetime_from_title(title, timezone_name)
+            created_dt, was_corrected = resolve_created_datetime(
+                title=title,
+                timezone_name=timezone_name,
+                doc_year_override=doc_year_override,
+            )
+            if was_corrected:
+                corrected_year_count += 1
             created_unix = int(created_dt.timestamp())
             page_id = make_bafy_id(
                 f"{seed_prefix}|page|{docx_path.name}|section:{section_index}|{title}"
@@ -459,7 +498,7 @@ def page_from_docx(
                     )
                 )
 
-        return out_pages, review_entries
+        return out_pages, review_entries, corrected_year_count
 
 
 def page_object_from_proto(
@@ -590,10 +629,11 @@ def build_anytype_zip(
     template_zip: Path,
     timezone_name: str,
     ink_cluster_threshold: int,
-) -> list[ManualReviewEntry]:
+) -> tuple[list[ManualReviewEntry], int]:
     template = load_template(template_zip)
     output_zip.parent.mkdir(parents=True, exist_ok=True)
     all_review_entries: list[ManualReviewEntry] = []
+    corrected_year_count = 0
 
     with zipfile.ZipFile(output_zip, "w", compression=zipfile.ZIP_DEFLATED) as out:
         # Keep baseline schema files.
@@ -606,7 +646,7 @@ def build_anytype_zip(
 
         for idx, docx_path in enumerate(docx_files, start=1):
             seed_prefix = f"{output_zip.name}|{idx}|{docx_path.name}|{os.path.getsize(docx_path)}"
-            pages, review_entries = page_from_docx(
+            pages, review_entries, corrected_count_for_docx = page_from_docx(
                 docx_path=docx_path,
                 template=template,
                 timezone_name=timezone_name,
@@ -614,6 +654,7 @@ def build_anytype_zip(
                 ink_cluster_threshold=ink_cluster_threshold,
             )
             all_review_entries.extend(review_entries)
+            corrected_year_count += corrected_count_for_docx
 
             for page_obj, file_entries in pages:
                 page_id = page_obj["snapshot"]["data"]["details"]["id"]
@@ -632,7 +673,7 @@ def build_anytype_zip(
 
                 print(f"OK: {docx_path.name} -> objects/{page_id}.pb.json")
 
-    return all_review_entries
+    return all_review_entries, corrected_year_count
 
 
 def collect_manual_review_entries(
@@ -836,6 +877,7 @@ def main(argv: list[str]) -> int:
                 docx_files=docx_files,
                 ink_cluster_threshold=args.ink_cluster_threshold,
             )
+            corrected_year_count = 0
         else:
             if not template_zip.exists():
                 raise ValueError(
@@ -843,7 +885,7 @@ def main(argv: list[str]) -> int:
                     f"{template_zip}. Lege eine Datei wie 'Anytype-Template.zip' bereit "
                     "oder nutze --template-zip <pfad>."
                 )
-            review_entries = build_anytype_zip(
+            review_entries, corrected_year_count = build_anytype_zip(
                 docx_files=docx_files,
                 output_zip=output_zip,
                 template_zip=template_zip,
@@ -860,6 +902,11 @@ def main(argv: list[str]) -> int:
         else:
             write_manual_review_report(report_path, review_entries)
             print(f"Manual-Review-Report: {report_path}")
+            if corrected_year_count > 0:
+                print(
+                    "Korrigierte Jahres-Tippfehler aus DOCX-Dateiname: "
+                    f"{corrected_year_count}"
+                )
             print(f"Fertig: {output_zip}")
         return 0
     except Exception as exc:  # noqa: BLE001

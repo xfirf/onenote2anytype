@@ -18,6 +18,8 @@ Der aktuelle Fokus liegt auf `converter_anytype.py`.
   - nur die Titelzeile bestimmt `createdDate`
   - direkt folgende Wochentag-/Uhrzeit-Zeilen werden ignoriert
   - Uhrzeit ist immer `12:00` in der gewaehlten Zeitzone
+  - wenn der Dateiname ein Jahr enthaelt (z. B. `2024.docx`) und ein Titel versehentlich ein anderes Jahr hat,
+    wird fuer `createdDate` automatisch das Dokumentjahr verwendet
 - Uebernimmt Bilder, Fett-Markierungen und einfache Aufzaehlungen.
 
 ## Voraussetzungen
