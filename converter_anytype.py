@@ -347,6 +347,12 @@ def page_from_docx(
         review_entries: list[ManualReviewEntry] = []
         corrected_year_count = 0
         doc_year_override = infer_doc_year_from_filename(docx_path)
+        template_page_type_id = (
+            template.page_proto.get("snapshot", {})
+            .get("data", {})
+            .get("details", {})
+            .get("type")
+        )
 
         for section_index, section in enumerate(sections, start=1):
             title = section.title
@@ -471,6 +477,7 @@ def page_from_docx(
                 created_unix=created_unix,
                 file_ids=list_of_file_ids,
                 content_blocks=content_blocks,
+                forced_type_id=template_page_type_id,
             )
             out_pages.append((page_obj, file_entries))
 
@@ -508,6 +515,7 @@ def page_object_from_proto(
     created_unix: int,
     file_ids: list[str],
     content_blocks: list[dict],
+    forced_type_id: str | None = None,
 ) -> dict:
     obj = copy.deepcopy(proto)
     blocks = obj["snapshot"]["data"]["blocks"]
@@ -544,6 +552,8 @@ def page_object_from_proto(
     details["createdDate"] = created_unix
     details["lastModifiedDate"] = created_unix
     details["addedDate"] = created_unix
+    if forced_type_id:
+        details["type"] = forced_type_id
     details["links"] = file_ids
     details["backlinks"] = []
     details["mentions"] = []
