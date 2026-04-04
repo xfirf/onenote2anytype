@@ -157,6 +157,16 @@ class ParsedTitleDate:
     suffix: str
 
 
+@dataclass
+class ParsedFilenameDateTime:
+    year: int
+    month: int
+    day: int
+    hour: int
+    minute: int
+    suffix: str
+
+
 WEEKDAY_RE = re.compile(
     r"^(Montag|Dienstag|Mittwoch|Donnerstag|Freitag|Samstag|Sonntag),\s+\d{1,2}\.\s+[A-Za-zÄÖÜäöüß]+\s+\d{4}$",
     re.IGNORECASE,
@@ -221,6 +231,9 @@ ENGLISH_WEEKDAY_DATE_RE = re.compile(
 
 TIME_24H_RE = re.compile(r"^(\d{1,2}):(\d{2})$")
 TIME_AMPM_RE = re.compile(r"^(\d{1,2}):(\d{2})\s*([AP]M)$", re.IGNORECASE)
+FILENAME_DATETIME_PREFIX_RE = re.compile(
+    r"^(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})(?:\s+(.*))?$"
+)
 
 
 def load_template(template_zip: Path) -> TemplateData:
@@ -397,11 +410,76 @@ def parse_time_value(raw: str) -> tuple[int, int] | None:
     return None
 
 
-def resolve_time_from_section(section: EntrySection) -> tuple[int, int]:
-    title_date = parse_title_date(section.title)
-    if not title_date:
-        return 12, 0
+def parse_filename_datetime_prefix(docx_path: Path) -> ParsedFilenameDateTime | None:
+    match = FILENAME_DATETIME_PREFIX_RE.match(docx_path.stem.strip())
+    if not match:
+        return None
 
+    year = int(match.group(1))
+    month = int(match.group(2))
+    day = int(match.group(3))
+    hour = int(match.group(4))
+    minute = int(match.group(5))
+    suffix = (match.group(6) or "").strip()
+
+    try:
+        datetime(year, month, day, hour, minute)
+    except ValueError:
+        return None
+
+    return ParsedFilenameDateTime(
+        year=year,
+        month=month,
+        day=day,
+        hour=hour,
+        minute=minute,
+        suffix=suffix,
+    )
+
+
+def build_created_datetime(
+    year: int,
+    month: int,
+    day: int,
+    hour: int,
+    minute: int,
+    timezone_name: str,
+) -> datetime:
+    base_title = normalize_title(day, month, year, "")
+    created_dt = parse_created_datetime_from_title(base_title, timezone_name)
+    return created_dt.replace(hour=hour, minute=minute, second=0, microsecond=0)
+
+
+def normalize_entry_suffix(raw: str, year: int, month: int, day: int) -> str:
+    text = raw.strip()
+    if not text:
+        return ""
+
+    if text.casefold() in {"notiz", "unbenannt", "untitled"}:
+        return ""
+
+    parsed = parse_title_date(text)
+    if parsed:
+        return parsed.suffix.strip()
+
+    return text
+
+
+def choose_entry_suffix(
+    filename_suffix: str,
+    section_title: str,
+    year: int,
+    month: int,
+    day: int,
+) -> str:
+    for candidate in (filename_suffix, section_title):
+        suffix = normalize_entry_suffix(candidate, year, month, day)
+        if suffix:
+            return suffix
+    return ""
+
+
+def scan_section_header_fields(section: EntrySection) -> tuple[date | None, tuple[int, int] | None]:
     title_consumed = False
     weekday_dt: date | None = None
     parsed_time: tuple[int, int] | None = None
@@ -409,6 +487,7 @@ def resolve_time_from_section(section: EntrySection) -> tuple[int, int]:
     for element in section.elements:
         if not isinstance(element, TextElement):
             continue
+
         text = element.plain_text.strip()
         if not text:
             continue
@@ -420,15 +499,56 @@ def resolve_time_from_section(section: EntrySection) -> tuple[int, int]:
         if weekday_dt is None:
             weekday_dt = parse_weekday_date(text)
             if weekday_dt is not None:
+                if parsed_time is not None:
+                    break
                 continue
 
         if parsed_time is None:
             parsed_time = parse_time_value(text)
             if parsed_time is not None:
-                break
+                if weekday_dt is not None:
+                    break
+                continue
 
-        # If we hit normal content before finding both header fields, stop scanning.
-        break
+        if not should_skip_header_artifact(text):
+            break
+
+    return weekday_dt, parsed_time
+
+
+def resolve_datetime_from_section_fallback(section: EntrySection, timezone_name: str) -> datetime | None:
+    weekday_dt, parsed_time = scan_section_header_fields(section)
+
+    if weekday_dt is None:
+        parsed_title = parse_title_date(section.title)
+        if parsed_title is None:
+            return None
+        try:
+            weekday_dt = date(parsed_title.year, parsed_title.month, parsed_title.day)
+        except ValueError:
+            return None
+
+    hour, minute = parsed_time if parsed_time is not None else (12, 0)
+
+    try:
+        return build_created_datetime(
+            year=weekday_dt.year,
+            month=weekday_dt.month,
+            day=weekday_dt.day,
+            hour=hour,
+            minute=minute,
+            timezone_name=timezone_name,
+        )
+    except ValueError:
+        return None
+
+
+def resolve_time_from_section(section: EntrySection) -> tuple[int, int]:
+    title_date = parse_title_date(section.title)
+    if not title_date:
+        return 12, 0
+
+    weekday_dt, parsed_time = scan_section_header_fields(section)
 
     if weekday_dt is None or parsed_time is None:
         return 12, 0
@@ -466,7 +586,10 @@ def split_into_sections(elements: list[Element]) -> list[EntrySection]:
     if sections:
         return sections
 
-    fallback_title = extract_title(elements)
+    try:
+        fallback_title = extract_title(elements)
+    except ValueError:
+        fallback_title = "Unbenannt"
     return [EntrySection(title=fallback_title, elements=list(elements))]
 
 
@@ -582,6 +705,8 @@ def page_from_docx(
         corrected_year_count = 0
         image_counter_by_entry_slug: dict[str, int] = {}
         doc_year_override = infer_doc_year_from_filename(docx_path)
+        filename_datetime = parse_filename_datetime_prefix(docx_path)
+        use_filename_datetime_primary = filename_datetime is not None and len(sections) == 1
         template_page_type_id = (
             template.page_proto.get("snapshot", {})
             .get("data", {})
@@ -591,30 +716,80 @@ def page_from_docx(
 
         for section_index, section in enumerate(sections, start=1):
             parsed_title = parse_title_date(section.title)
-            if parsed_title is None:
+            created_dt: datetime
+
+            if use_filename_datetime_primary and filename_datetime is not None:
+                suffix = choose_entry_suffix(
+                    filename_suffix=filename_datetime.suffix,
+                    section_title=section.title,
+                    year=filename_datetime.year,
+                    month=filename_datetime.month,
+                    day=filename_datetime.day,
+                )
+                title = normalize_title(
+                    filename_datetime.day,
+                    filename_datetime.month,
+                    filename_datetime.year,
+                    suffix,
+                )
+                created_dt = build_created_datetime(
+                    year=filename_datetime.year,
+                    month=filename_datetime.month,
+                    day=filename_datetime.day,
+                    hour=filename_datetime.hour,
+                    minute=filename_datetime.minute,
+                    timezone_name=timezone_name,
+                )
+            elif parsed_title is not None:
+                title = parsed_title.normalized_title
+                time_hour, time_minute = resolve_time_from_section(section)
+                created_dt, was_corrected = resolve_created_datetime(
+                    parsed_title=parsed_title,
+                    timezone_name=timezone_name,
+                    doc_year_override=doc_year_override,
+                    hour=time_hour,
+                    minute=time_minute,
+                )
+                if was_corrected:
+                    corrected_year_count += 1
+                    corrected_title = normalize_title(
+                        parsed_title.day,
+                        parsed_title.month,
+                        doc_year_override or parsed_title.year,
+                        parsed_title.suffix,
+                    )
+                    title = corrected_title
+            else:
+                fallback_dt = resolve_datetime_from_section_fallback(
+                    section=section,
+                    timezone_name=timezone_name,
+                )
+                if fallback_dt is None:
+                    raise ValueError(
+                        f"Titelzeile konnte nicht als Datum erkannt werden: {section.title!r}"
+                    )
+
+                suffix = choose_entry_suffix(
+                    filename_suffix="",
+                    section_title=section.title,
+                    year=fallback_dt.year,
+                    month=fallback_dt.month,
+                    day=fallback_dt.day,
+                )
+                title = normalize_title(
+                    fallback_dt.day,
+                    fallback_dt.month,
+                    fallback_dt.year,
+                    suffix,
+                )
+                created_dt = fallback_dt
+
+            if not title:
                 raise ValueError(
                     f"Titelzeile konnte nicht als Datum erkannt werden: {section.title!r}"
                 )
 
-            title = parsed_title.normalized_title
             entry_slug = slugify(title)
-            time_hour, time_minute = resolve_time_from_section(section)
-            created_dt, was_corrected = resolve_created_datetime(
-                parsed_title=parsed_title,
-                timezone_name=timezone_name,
-                doc_year_override=doc_year_override,
-                hour=time_hour,
-                minute=time_minute,
-            )
-            if was_corrected:
-                corrected_year_count += 1
-                corrected_title = normalize_title(
-                    parsed_title.day,
-                    parsed_title.month,
-                    doc_year_override or parsed_title.year,
-                    parsed_title.suffix,
-                )
-                title = corrected_title
             created_unix = int(created_dt.timestamp())
             page_id = make_bafy_id(
                 f"{seed_prefix}|page|{docx_path.name}|section:{section_index}|{title}"
@@ -893,11 +1068,12 @@ def build_anytype_zip(
     template_zip: Path,
     timezone_name: str,
     ink_cluster_threshold: int,
-) -> tuple[list[ManualReviewEntry], int]:
+) -> tuple[list[ManualReviewEntry], int, int]:
     template = load_template(template_zip)
     output_zip.parent.mkdir(parents=True, exist_ok=True)
     all_review_entries: list[ManualReviewEntry] = []
     corrected_year_count = 0
+    skipped_docx_count = 0
 
     with zipfile.ZipFile(output_zip, "w", compression=zipfile.ZIP_DEFLATED) as out:
         # Keep baseline schema files.
@@ -910,13 +1086,21 @@ def build_anytype_zip(
 
         for idx, docx_path in enumerate(docx_files, start=1):
             seed_prefix = f"{output_zip.name}|{idx}|{docx_path.name}|{os.path.getsize(docx_path)}"
-            pages, review_entries, corrected_count_for_docx = page_from_docx(
-                docx_path=docx_path,
-                template=template,
-                timezone_name=timezone_name,
-                seed_prefix=seed_prefix,
-                ink_cluster_threshold=ink_cluster_threshold,
-            )
+            try:
+                pages, review_entries, corrected_count_for_docx = page_from_docx(
+                    docx_path=docx_path,
+                    template=template,
+                    timezone_name=timezone_name,
+                    seed_prefix=seed_prefix,
+                    ink_cluster_threshold=ink_cluster_threshold,
+                )
+            except Exception as exc:  # noqa: BLE001
+                skipped_docx_count += 1
+                print(
+                    f"WARN: {docx_path.name} uebersprungen ({exc})",
+                    file=sys.stderr,
+                )
+                continue
             all_review_entries.extend(review_entries)
             corrected_year_count += corrected_count_for_docx
 
@@ -937,7 +1121,7 @@ def build_anytype_zip(
 
                 print(f"OK: {docx_path.name} -> objects/{page_id}.pb.json")
 
-    return all_review_entries, corrected_year_count
+    return all_review_entries, corrected_year_count, skipped_docx_count
 
 
 def collect_manual_review_entries(
@@ -1121,6 +1305,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 
 def main(argv: list[str]) -> int:
     try:
+        if hasattr(sys.stdout, "reconfigure"):
+            sys.stdout.reconfigure(errors="replace")
+        if hasattr(sys.stderr, "reconfigure"):
+            sys.stderr.reconfigure(errors="replace")
+
         args = parse_args(argv)
         input_path = Path(args.input).expanduser().resolve()
         output_zip = Path(args.output).expanduser().resolve()
@@ -1142,6 +1331,7 @@ def main(argv: list[str]) -> int:
                 ink_cluster_threshold=args.ink_cluster_threshold,
             )
             corrected_year_count = 0
+            skipped_docx_count = 0
         else:
             if not template_zip.exists():
                 raise ValueError(
@@ -1149,7 +1339,7 @@ def main(argv: list[str]) -> int:
                     f"{template_zip}. Lege eine Datei wie 'Anytype-Template.zip' bereit "
                     "oder nutze --template-zip <pfad>."
                 )
-            review_entries, corrected_year_count = build_anytype_zip(
+            review_entries, corrected_year_count, skipped_docx_count = build_anytype_zip(
                 docx_files=docx_files,
                 output_zip=output_zip,
                 template_zip=template_zip,
@@ -1171,6 +1361,8 @@ def main(argv: list[str]) -> int:
                     "Korrigierte Jahres-Tippfehler aus DOCX-Dateiname: "
                     f"{corrected_year_count}"
                 )
+            if skipped_docx_count > 0:
+                print(f"Uebersprungene DOCX wegen Fehlern: {skipped_docx_count}")
             print(f"Fertig: {output_zip}")
         return 0
     except Exception as exc:  # noqa: BLE001

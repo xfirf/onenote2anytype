@@ -18,12 +18,12 @@ Der aktuelle Fokus liegt auf `converter_anytype.py`.
   - `Month dd, yyyy`, `Month dd yyyy`, `... at hh:mmAM/PM`
   - Ausgabe-Titel immer als `dd. Monat yyyy` (plus optionale Erweiterung)
 - Datumsregel:
-  - nur die Titelzeile bestimmt `createdDate`
-  - wenn Wochentag-Zeile darunter denselben Kalendertag hat, wird deren Uhrzeit uebernommen
-  - wenn der Tag nicht uebereinstimmt, wird `12:00` verwendet
-  - wenn der Dateiname ein Jahr enthaelt (z. B. `2024.docx`) und ein Titel versehentlich ein anderes Jahr hat,
-    wird fuer `createdDate` automatisch das Dokumentjahr verwendet
+  - wenn der Dateiname mit `YYYY-MM-DD_HH-mm` beginnt, ist das primaere Datum/Uhrzeit fuer `createdDate`
+  - wenn kein passender Dateiname vorliegt, wird wie bisher aus Titel/Wochentag/Uhrzeit im Dokument aufgeloest
+  - wenn Wochentag/Titel fehlen oder widersprechen, faellt der Converter auf `12:00` fuer den erkannten Tag zurueck
+  - bei alten Sammel-DOCX ohne Dateiname-Praefix bleibt das bisherige Titel-Verhalten aktiv
 - Uebernimmt Bilder, Fett-Markierungen und einfache Aufzaehlungen.
+- Defekte/leer exportierte DOCX werden mit Warnung uebersprungen, damit der Rest weiter konvertiert.
 
 ## Voraussetzungen
 
@@ -89,3 +89,62 @@ python converter_anytype.py --input "F:\\OneNoteExport\\2026" --template-zip "F:
 - Wenn Titel-Datum und OneNote-Wochentag widersprechen, gilt immer der Titel.
 
 Viel Spass beim Importieren 🚀
+
+## OneNote per Microsoft Graph exportieren (Seite fuer Seite)
+
+Wenn OneNote-Sammel-Exporte kaputte DOCX erzeugen, kannst du Seiten einzeln per Graph ziehen:
+
+1. Azure App als Public Client anlegen (delegated Permission: `Notes.Read`).
+2. Abhaengigkeiten installieren:
+
+```bash
+pip install msal requests
+```
+
+3. Optional Pandoc installieren, wenn direkt `.docx` erzeugt werden soll.
+4. Script starten (Beispiel fuer dein Notebook/Abschnitte):
+
+```bash
+python export_onenote_graph.py --client-id "<DEINE-APP-ID>" --notebook "Tagebücher" --sections "1981-2016" "2017-2018" --output "F:\OneNoteGraphExport" --convert-docx
+```
+
+Ergebnis:
+
+- HTML je Seite unter `<output>/<Notebook>/<Section>/_html/`
+- optional DOCX je Seite unter `<output>/<Notebook>/<Section>/`
+
+Danach kannst du wie gewohnt den Anytype-Converter auf den Export-Ordner laufen lassen.
+
+## OneNote ohne Azure/Graph (lokal per COM)
+
+Wenn du keinen Azure/Graph-Setup willst, kannst du direkt die lokale OneNote-Desktop-App nutzen.
+Das Script exportiert Seiten einzeln als DOCX ueber die OneNote COM-Schnittstelle.
+
+Voraussetzungen:
+
+- Windows mit installierter OneNote-Desktop-App (Microsoft 365 / OneNote 2016)
+- Notebook und Abschnitte sind in OneNote geoeffnet/synchronisiert
+
+Beispiel (dein Fall):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\export_onenote_com.ps1 -Notebook "Tagebücher" -Sections "1981-2016","2017-2018" -Output "F:\OneNoteComExport"
+```
+
+Hinweis: Abschnittsnamen mit und ohne Leerzeichen um den Bindestrich werden akzeptiert
+(`1981-2016` und `1981 - 2016` funktionieren beide).
+
+Nutzliche Optionen:
+
+- Nur pruefen/listen, ohne Export: `-ListOnly`
+- Seitenlimit pro Abschnitt: `-LimitPages 20`
+- Bei Fehlern sofort abbrechen (statt weiterlaufen): `-StopOnError`
+
+Ergebnis:
+
+- DOCX je Seite unter `<output>/<Notebook>/<Section>/`
+- Vollreport mit allen Seiten unter `<output>/<Notebook>/_export-report.json`
+- Nur Fehlseiten unter `<output>/<Notebook>/_export-failures.json` und `<output>/<Notebook>/_export-failures.csv`
+- Kurzsummary unter `<output>/<Notebook>/_export-summary.txt`
+
+Standardverhalten: Das Script loggt Fehler pro Seite und macht mit der naechsten Seite weiter.
